@@ -53,6 +53,16 @@ if { $list_projs eq "" } {
    set_property BOARD_PART xilinx.com:zcu104:part0:1.1 [current_project]
 }
 
+set_property ip_repo_paths [list \
+  "[file normalize ${script_folder}/../../ip/hls/color_convert_2/solution1/impl/ip]" \
+  "[file normalize ${script_folder}/../../ip/hls/pixel_pack_2/solution1/impl/ip]" \
+  "[file normalize ${script_folder}/../../ip/hls/pixel_unpack_2/solution1/impl/ip]" \
+  "[file normalize ${script_folder}/../../ip/hls/trace_cntrl_32/solution1/impl/ip]" \
+  "[file normalize ${script_folder}/../../ip/hls/trace_cntrl_64/solution1/impl/ip]" \
+  "[file normalize ${script_folder}/../../ip]" \
+  "/afs/andrew.cmu.edu/usr3/jtbell/private/vivado_ws/PYNQ/boards/ZCU104/ip_repo" \
+] [current_project]
+update_ip_catalog -rebuild
 
 # CHANGE DESIGN NAME HERE
 variable design_name
