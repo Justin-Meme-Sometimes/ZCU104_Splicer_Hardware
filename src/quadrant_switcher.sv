@@ -1,3 +1,4 @@
+`timescale 1ns/1ps
 // quadrant_switcher.sv
 //
 // Cycles VDMA MM2S start address through 4 quadrants on each frame_done edge.
@@ -16,6 +17,7 @@
 //   0x14: STRIDE     - full input row stride in bytes
 //   0x18: VDMA_ADDR  - physical address of VDMA register space
 //   0x1C: STATUS     [1:0] = current_quadrant (read-only)
+//   0x20: TRIG       write any value to manually trigger one FSM cycle (debug)
 //
 // Fixes applied:
 //   1. Added M_CALC state so `quadrant` FF settles before addresses are latched.
@@ -27,9 +29,9 @@
 //      values instead of re-evaluating the purely combinational wr_addr[]/wr_data[]
 //      arrays throughout the write sequence, eliminating potential mid-sequence
 //      glitches if config registers or quadrant change.
-//   3. fd_sync shift direction fixed: was {fd_sync[0], frame_done} which means
-//      fd_sync[1] is newer -- reversed to {fd_sync[1], frame_done} with rising
-//      edge = fd_sync[1] & ~fd_sync[0] for a clean 2-FF synchroniser.
+//   3. Added proper 2-FF CDC synchroniser for frame_done (300 MHz VDMA clock ->
+//      100 MHz AXI clock). Edge detection now runs on fd_sync[1], the resolved
+//      output, rather than the raw async signal.
 
 module quadrant_switcher #(
     parameter AXI_ADDR_WIDTH = 32,
@@ -38,11 +40,11 @@ module quadrant_switcher #(
     input  logic clk,
     input  logic resetn,
 
-    // Frame-done from VDMA mm2s_introut
+    // Frame-done from VDMA mm2s_introut (level signal, held high until IOC cleared)
     input  logic frame_done,
 
     // AXI-Lite slave for PS configuration
-    input  logic [4:0]                s_axi_awaddr,
+    input  logic [5:0]                s_axi_awaddr,
     input  logic                      s_axi_awvalid,
     output logic                      s_axi_awready,
     input  logic [AXI_DATA_WIDTH-1:0] s_axi_wdata,
@@ -52,7 +54,7 @@ module quadrant_switcher #(
     output logic [1:0]                s_axi_bresp,
     output logic                      s_axi_bvalid,
     input  logic                      s_axi_bready,
-    input  logic [4:0]                s_axi_araddr,
+    input  logic [5:0]                s_axi_araddr,
     input  logic                      s_axi_arvalid,
     output logic                      s_axi_arready,
     output logic [AXI_DATA_WIDTH-1:0] s_axi_rdata,
@@ -90,23 +92,54 @@ module quadrant_switcher #(
     logic [31:0] reg_bpp;        // 0x10
     logic [31:0] reg_stride;     // 0x14
     logic [31:0] reg_vdma_addr;  // 0x18
+    // 0x1C = STATUS (read-only)
+    logic        sw_trig;        // 0x20: single-cycle pulse on write
 
-    wire enable = reg_ctrl[0];
+    
 
     // =========================================================
-    // Frame-done edge detection  (FIX #3)
-    // 2-FF synchroniser: fd_sync[0] = first stage (oldest),
-    //                    fd_sync[1] = second stage (newest)
-    // Rising edge fires one cycle after frame_done goes high.
+    // Clock-domain crossing: frame_done is 300 MHz, clk is 100 MHz.
+    // 2-FF synchroniser brings it into the 100 MHz domain before
+    // any edge detection.
+    //   fd_sync[0] = first stage (may be metastable, do not use)
+    //   fd_sync[1] = second stage (resolved, safe to use)
+    // Rising edge fires one cycle after fd_sync[1] goes high.
     // =========================================================
-    logic [1:0] fd_sync;
-    wire fd_rising = fd_sync[1] & ~fd_sync[0];
+    logic [1:0] fd_sync;   // synchroniser chain
+    logic fd_prev;         // previous value of synchronised signal
+    logic fd_pending;
+    logic [7:0] raw_cnt;   // counts rising edges on raw frame_done (debug)
+    logic [7:0] frame_cnt; // counts rising edges on fd_sync[1] (debug)
+    logic fd_raw_prev;     // previous raw frame_done for edge detect
 
     always_ff @(posedge clk or negedge resetn) begin
-        if (!resetn)
-            fd_sync <= 2'b00;
-        else
-            fd_sync <= {fd_sync[0], frame_done};
+        if (!resetn) begin
+            fd_sync    <= 2'b0;
+            fd_prev    <= 1'b0;
+            fd_pending <= 1'b0;
+            fd_raw_prev <= 1'b0;
+            raw_cnt    <= 8'h0;
+            frame_cnt  <= 8'h0;
+        end else begin
+            // 2-FF synchroniser (CDC: 300 MHz -> 100 MHz)
+            fd_sync[0] <= frame_done;
+            fd_sync[1] <= fd_sync[0];
+
+            // Raw rising edge counter (metastable but ok for debug)
+            fd_raw_prev <= frame_done;
+            if (frame_done & ~fd_raw_prev) raw_cnt <= raw_cnt + 1;
+
+            // Synced rising edge counter
+            fd_prev <= fd_sync[1];
+            if (fd_sync[1] & ~fd_prev) frame_cnt <= frame_cnt + 1;
+
+            // fd_pending: rising edge or software trigger
+            if ((fd_sync[1] & ~fd_prev) || sw_trig) begin
+                fd_pending <= 1'b1;
+            end else if (m_state == M_IDLE && reg_ctrl[0] && fd_pending) begin
+                fd_pending <= 1'b0;
+            end
+        end
     end
 
     // =========================================================
@@ -134,19 +167,23 @@ module quadrant_switcher #(
     // =========================================================
     // VDMA register offsets (combinational)
     // =========================================================
-    logic [31:0] wr_addr [4];
-    logic [31:0] wr_data [4];
+    logic [31:0] wr_addr [5];
+    logic [31:0] wr_data [5];
 
     always_comb begin
-        wr_addr[0] = reg_vdma_addr + 32'h5C; // MM2S start addr
-        wr_addr[1] = reg_vdma_addr + 32'h58; // MM2S stride
-        wr_addr[2] = reg_vdma_addr + 32'h54; // MM2S hsize
-        wr_addr[3] = reg_vdma_addr + 32'h50; // MM2S vsize
+        // IOC clear MUST be first so mm2s_introut goes low immediately,
+        // freeing it to fire again on the next frame before the FSM finishes.
+        wr_addr[0] = reg_vdma_addr + 32'h04; // MM2S_VDMASR -- clear IOC (bit 12)
+        wr_addr[1] = reg_vdma_addr + 32'h5C; // MM2S start addr
+        wr_addr[2] = reg_vdma_addr + 32'h58; // MM2S stride
+        wr_addr[3] = reg_vdma_addr + 32'h54; // MM2S hsize
+        wr_addr[4] = reg_vdma_addr + 32'h50; // MM2S vsize (triggers reload)
 
-        wr_data[0] = start_addr;
-        wr_data[1] = reg_stride;
-        wr_data[2] = hsize;
-        wr_data[3] = vsize;
+        wr_data[0] = 32'h00001000;            // clear IOC (bit 12)
+        wr_data[1] = start_addr;
+        wr_data[2] = reg_stride;
+        wr_data[3] = hsize;
+        wr_data[4] = vsize;
     end
 
     // =========================================================
@@ -154,8 +191,8 @@ module quadrant_switcher #(
     // Captured in M_CALC after quadrant has settled.
     // The FSM iterates over these rather than the live comb arrays.
     // =========================================================
-    logic [31:0] snap_addr [4];
-    logic [31:0] snap_data [4];
+    logic [31:0] snap_addr [5];
+    logic [31:0] snap_data [5];
 
     // =========================================================
     // AXI-Lite master FSM
@@ -172,12 +209,12 @@ module quadrant_switcher #(
     } master_state_t;
 
     master_state_t m_state;
-    logic [1:0]    wr_index;
+    logic [2:0]    wr_index;
 
     always_ff @(posedge clk or negedge resetn) begin
         if (!resetn) begin
             m_state       <= M_IDLE;
-            wr_index      <= 2'd0;
+            wr_index      <= 3'd0;
             quadrant      <= 2'd0;
             m_axi_awvalid <= 1'b0;
             m_axi_wvalid  <= 1'b0;
@@ -185,7 +222,7 @@ module quadrant_switcher #(
             m_axi_awaddr  <= '0;
             m_axi_wdata   <= '0;
             m_axi_wstrb   <= 4'hF;
-            for (int i = 0; i < 4; i++) begin
+            for (int i = 0; i < 5; i++) begin
                 snap_addr[i] <= '0;
                 snap_data[i] <= '0;
             end
@@ -197,9 +234,9 @@ module quadrant_switcher #(
                 // -------------------------------------------------
                 M_IDLE: begin
                     m_axi_bready <= 1'b0;
-                    if (enable && fd_rising) begin
+                    if (reg_ctrl[0] && fd_pending) begin
                         quadrant <= quadrant + 2'd1;  // FF update scheduled
-                        wr_index <= 2'd0;
+                        wr_index <= 3'd0;
                         m_state  <= M_CALC;           // wait one cycle (FIX #1)
                     end
                 end
@@ -212,8 +249,8 @@ module quadrant_switcher #(
                 //   the first AXI write.
                 // -------------------------------------------------
                 M_CALC: begin
-                    for (int i = 0; i < 4; i++) begin
-                        snap_addr[i] <= wr_addr[i];   // FIX #2: stable snapshot
+                    for (int i = 0; i < 5; i++) begin
+                        snap_addr[i] <= wr_addr[i];
                         snap_data[i] <= wr_data[i];
                     end
                     // Kick off first write using the live (now correct) values
@@ -244,7 +281,7 @@ module quadrant_switcher #(
                 end
 
                 // -------------------------------------------------
-                // Address accepted; waiting for data
+                // Data accepted first; waiting for address channel
                 // -------------------------------------------------
                 M_WR_ADDR: begin
                     if (m_axi_awready) begin
@@ -255,7 +292,7 @@ module quadrant_switcher #(
                 end
 
                 // -------------------------------------------------
-                // Data accepted; waiting for address
+                // Address accepted first; waiting for data channel
                 // -------------------------------------------------
                 M_WR_DATA: begin
                     if (m_axi_wready) begin
@@ -280,13 +317,13 @@ module quadrant_switcher #(
                 // FIX #2: use snap arrays instead of live comb
                 // -------------------------------------------------
                 M_NEXT: begin
-                    if (wr_index == 2'd3) begin
+                    if (wr_index == 3'd4) begin
                         m_state <= M_DONE;
                     end else begin
-                        wr_index          <= wr_index + 2'd1;
-                        m_axi_awaddr  <= snap_addr[wr_index + 2'd1];
+                        wr_index      <= wr_index + 3'd1;
+                        m_axi_awaddr  <= snap_addr[wr_index + 3'd1];
                         m_axi_awvalid <= 1'b1;
-                        m_axi_wdata   <= snap_data[wr_index + 2'd1];
+                        m_axi_wdata   <= snap_data[wr_index + 3'd1];
                         m_axi_wvalid  <= 1'b1;
                         m_axi_wstrb   <= 4'hF;
                         m_state       <= M_WR_BOTH;
@@ -297,7 +334,9 @@ module quadrant_switcher #(
                 // Done -- return to idle
                 // -------------------------------------------------
                 M_DONE: begin
-                    m_state <= M_IDLE;
+                    if (~fd_sync[1]) begin
+                        m_state <= M_IDLE;
+                    end
                 end
 
                 default: m_state <= M_IDLE;
@@ -315,7 +354,7 @@ module quadrant_switcher #(
     // AXI-Lite slave -- PS writes configuration registers
     // =========================================================
     logic s_aw_done, s_w_done;
-    logic [4:0] s_wr_addr_reg;
+    logic [5:0] s_wr_addr_reg;
 
     // Write address channel
     always_ff @(posedge clk or negedge resetn) begin
@@ -363,16 +402,22 @@ module quadrant_switcher #(
             reg_bpp        <= 32'd1;
             reg_stride     <= 32'd3840;
             reg_vdma_addr  <= '0;
-        end else if (s_aw_done && s_w_done && !s_axi_bvalid) begin
-            case (s_wr_addr_reg[4:2])
-                3'h0: reg_ctrl       <= s_axi_wdata;
-                3'h1: reg_base_addr  <= s_axi_wdata;
-                3'h2: reg_out_width  <= s_axi_wdata;
-                3'h3: reg_out_height <= s_axi_wdata;
-                3'h4: reg_bpp        <= s_axi_wdata;
-                3'h5: reg_stride     <= s_axi_wdata;
-                3'h6: reg_vdma_addr  <= s_axi_wdata;
-            endcase
+            sw_trig        <= 1'b0;
+        end else begin
+            sw_trig <= 1'b0;  // self-clearing every cycle
+            if (s_aw_done && s_w_done && !s_axi_bvalid) begin
+                case (s_wr_addr_reg[5:2])
+                    4'h0: reg_ctrl       <= s_axi_wdata;
+                    4'h1: reg_base_addr  <= s_axi_wdata;
+                    4'h2: reg_out_width  <= s_axi_wdata;
+                    4'h3: reg_out_height <= s_axi_wdata;
+                    4'h4: reg_bpp        <= s_axi_wdata;
+                    4'h5: reg_stride     <= s_axi_wdata;
+                    4'h6: reg_vdma_addr  <= s_axi_wdata;
+                    // 4'h7 = STATUS (read-only)
+                    4'h8: sw_trig        <= 1'b1;  // any write triggers one FSM cycle
+                endcase
+            end
         end
     end
 
@@ -403,15 +448,16 @@ module quadrant_switcher #(
                 s_axi_arready <= 1'b1;
                 s_axi_rvalid  <= 1'b1;
                 s_axi_rresp   <= 2'b00;
-                case (s_axi_araddr[4:2])
-                    3'h0: s_axi_rdata <= reg_ctrl;
-                    3'h1: s_axi_rdata <= reg_base_addr;
-                    3'h2: s_axi_rdata <= reg_out_width;
-                    3'h3: s_axi_rdata <= reg_out_height;
-                    3'h4: s_axi_rdata <= reg_bpp;
-                    3'h5: s_axi_rdata <= reg_stride;
-                    3'h6: s_axi_rdata <= reg_vdma_addr;
-                    3'h7: s_axi_rdata <= {30'd0, quadrant};
+                case (s_axi_araddr[5:2])
+                    4'h0: s_axi_rdata <= reg_ctrl;
+                    4'h1: s_axi_rdata <= reg_base_addr;
+                    4'h2: s_axi_rdata <= reg_out_width;
+                    4'h3: s_axi_rdata <= reg_out_height;
+                    4'h4: s_axi_rdata <= reg_bpp;
+                    4'h5: s_axi_rdata <= reg_stride;
+                    4'h6: s_axi_rdata <= reg_vdma_addr;
+                    4'h7: s_axi_rdata <= {frame_cnt, raw_cnt, 7'd0, fd_pending, m_state[3:0], 2'd0, quadrant};
+                    // 0x20 (4'h8) = TRIG write-only, reads as 0
                     default: s_axi_rdata <= '0;
                 endcase
             end else begin
