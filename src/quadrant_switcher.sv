@@ -42,6 +42,7 @@ module quadrant_switcher #(
 
     // Frame-done from VDMA mm2s_introut (level signal, held high until IOC cleared)
     input  logic frame_done,
+    output logic [1:0] quadrant_out,
 
     // AXI-Lite slave for PS configuration
     input  logic [5:0]                s_axi_awaddr,
@@ -146,7 +147,7 @@ module quadrant_switcher #(
     // Quadrant counter
     // =========================================================
     logic [1:0] quadrant;
-
+    assign quadrant_out = quadrant;
     // =========================================================
     // Address computation (combinational, based on current quadrant)
     // =========================================================
@@ -334,9 +335,7 @@ module quadrant_switcher #(
                 // Done -- return to idle
                 // -------------------------------------------------
                 M_DONE: begin
-                    if (~fd_sync[1]) begin
-                        m_state <= M_IDLE;
-                    end
+                    m_state <= M_IDLE;
                 end
 
                 default: m_state <= M_IDLE;
