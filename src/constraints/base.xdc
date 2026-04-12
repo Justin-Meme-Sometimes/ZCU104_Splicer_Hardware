@@ -4,6 +4,9 @@
 set_property PACKAGE_PIN M11 [get_ports reset]
 set_property IOSTANDARD LVCMOS33 [get_ports reset]
 
+set_false_path -from [get_clocks clk_pl_1] \
+               -to   [get_pins base_i/quadrant_switcher_1/inst/fd_sync_reg[0]/D]
+
 # HDMI RX
 set_property PACKAGE_PIN R10 [get_ports HDMI_RX_CLK_P_IN]; #revB
 
