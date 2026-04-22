@@ -82,9 +82,10 @@ splicer_proj_vivado/
 ├── scripts/
 │   └── working_script.tcl          # Vivado project restore script
 ├── src/
-│   └── hls/
-│       ├── splicer.cpp       # quadrant_switcher HLS source
-│       ├── splicer_test.cpp  # HLS testbench
-│       └── hls_config.cfg    # Vitis HLS synthesis config
+│   
+│     ├── splicer.sv        # quadrant_switcher sv source
+│     ├── frame_assembler.sv        # quadrant_switcher sv source
+│    
+│    
 └── README.md
 ```
