@@ -80,7 +80,7 @@ The TCL expects the HLS IP at `$origin_dir/../vitis_ws/splicer/splicer/hls/impl/
 ```
 splicer_proj_vivado/
 ├── scripts/
-│   └── base.tcl          # Vivado project restore script
+│   └── working_script.tcl          # Vivado project restore script
 ├── src/
 │   └── hls/
 │       ├── splicer.cpp       # quadrant_switcher HLS source
