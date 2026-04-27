@@ -15,7 +15,8 @@ The block design requires the following IPs. Standard Xilinx IPs will resolve au
 ### Custom / HLS IPs (must be built or added manually)
 | IP | Source |
 |----|--------|
-| `xilinx.com:hls:quadrant_switcher:1.0` | Build from `src/hls/splicer.cpp` using Vitis HLS |
+| `xilinx.com:hls:quadrant_switcher:1.0` | Build from `src/hls/splicer.cpp` using Vitis HLSe2
+|
 | `user.org:user:address_remap:1.0` | PYNQ boards IP repo |
 | `xilinx.com:user:dff_en_reset_vector:1.0` | PYNQ boards IP repo |
 | `xilinx.com:user:io_switch:1.1` | PYNQ boards IP repo |
