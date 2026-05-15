@@ -1,6 +1,6 @@
 # ZCU104 VDMA Quadrant Splicer
 
-Vivado block design for the ZCU104 HDMI base overlay with a custom `quadrant_switcher` HLS IP for flicker-free quadrant video switching.
+Vivado block design for the ZCU104 HDMI base overlay with a custom `quadrant_switcher` and `quadrant_builder` HLS IP for flicker-free quadrant video switching.
 
 ## Requirements
 
